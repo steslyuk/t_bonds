@@ -1,2 +1,1 @@
 python-telegram-bot>=21,<22
-git+https://github.com/RussianInvestments/invest-python.git
