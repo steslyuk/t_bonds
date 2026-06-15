@@ -1,2 +1,2 @@
 python-telegram-bot>=21,<22
-tinkoff-investments>=0.2,<1.0
+tinkoff-investments==0.2.0b118
