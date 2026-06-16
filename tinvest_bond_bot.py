@@ -453,7 +453,10 @@ def _to_dec(q):
 
 
 def fetch_universe_from_tinvest(token, term_y, max_candidates, include_qual, unknown_rating, verbose=True):
-    from tinkoff.invest import Client, InstrumentStatus  # noqa
+    try:
+        from t_tech.invest import Client, InstrumentStatus  # новый сервер Т-Банка
+    except ImportError:
+        from tinkoff.invest import Client, InstrumentStatus  # старый пакет с PyPI
     now = dt.datetime.now(dt.timezone.utc)
     horizon = now + dt.timedelta(days=int(term_y * 365 * 2.8) + 30)
     universe = []
@@ -634,6 +637,83 @@ def render_compare_html(results, amount, term):
     lines.append("<pre>" + "\n".join(rows) + "</pre>")
     lines.append("Нажми профиль ниже, чтобы увидеть полный состав 👇")
     return "\n".join(lines)
+
+
+# ----------------------------- интерактивная панель (степперы + пресеты) -----------------------------
+RISK_LABEL = {"cons": "Консервативный", "mod": "Умеренный", "agg": "Агрессивный"}
+
+
+def default_panel():
+    return {"amount": 1_500_000, "term": 3.0, "risk": "mod",
+            "reinvest": 18.0, "tax": True, "src": "demo"}
+
+
+def _amount_step(v):
+    if v < 1_000_000: return 100_000
+    if v < 3_000_000: return 250_000
+    if v < 5_000_000: return 500_000
+    if v < 20_000_000: return 1_000_000
+    return 5_000_000
+
+
+def step_amount(v, d):
+    step = _amount_step(v if d > 0 else v - 1)
+    nv = round((v + d * step) / step) * step
+    return int(max(100_000, min(100_000_000, nv)))
+
+
+def step_term(v, d):
+    return max(0.5, min(15.0, round((v + d * 0.5) * 2) / 2))
+
+
+def step_reinvest(v, d):
+    return max(0.0, min(30.0, round(v + d)))
+
+
+def apply_panel_action(s, data):
+    """Меняет состояние панели по callback_data. Возвращает True, если что-то изменилось."""
+    before = dict(s)
+    if data == "a-": s["amount"] = step_amount(s["amount"], -1)
+    elif data == "a+": s["amount"] = step_amount(s["amount"], +1)
+    elif data.startswith("ap:"): s["amount"] = int(data[3:])
+    elif data == "t-": s["term"] = step_term(s["term"], -1)
+    elif data == "t+": s["term"] = step_term(s["term"], +1)
+    elif data.startswith("tp:"): s["term"] = float(data[3:])
+    elif data.startswith("r:"): s["risk"] = data[2:]
+    elif data == "ri-": s["reinvest"] = step_reinvest(s["reinvest"], -1)
+    elif data == "ri+": s["reinvest"] = step_reinvest(s["reinvest"], +1)
+    elif data == "tax": s["tax"] = not s["tax"]
+    elif data == "src": s["src"] = "real" if s["src"] == "demo" else "demo"
+    return s != before
+
+
+def panel_text(s):
+    return (
+        "<b>⚙️ Параметры портфеля</b>\n\n"
+        f"💰 Сумма: <b>{_esc(fmt_rub(s['amount']))}</b>\n"
+        f"📅 Срок: <b>{s['term']:g} лет</b>\n"
+        f"⚖️ Риск: <b>{RISK_LABEL[s['risk']]}</b>\n"
+        f"🔁 Реинвест купонов: <b>{s['reinvest']:g}%</b>\n"
+        f"🧾 Налог: <b>{'учитывать' if s['tax'] else 'без налога'}</b>\n"
+        f"📡 Данные: <b>{'демо' if s['src'] == 'demo' else 'реальные (T-Invest)'}</b>\n\n"
+        "Настрой кнопками ниже и жми «Собрать портфель»."
+    )
+
+
+def panel_keyboard(s):
+    """Возвращает раскладку как список рядов из (текст, callback_data)."""
+    pick = lambda k: "✅ " if s["risk"] == k else ""
+    return [
+        [("➖", "a-"), (fmt_rub(s["amount"]), "noop"), ("➕", "a+")],
+        [("300к", "ap:300000"), ("1 млн", "ap:1000000"), ("3 млн", "ap:3000000"), ("10 млн", "ap:10000000")],
+        [("➖", "t-"), (f"срок: {s['term']:g} лет", "noop"), ("➕", "t+")],
+        [("1", "tp:1"), ("2", "tp:2"), ("3", "tp:3"), ("5", "tp:5"), ("7", "tp:7")],
+        [(pick("cons") + "Консерв.", "r:cons"), (pick("mod") + "Умерен.", "r:mod"), (pick("agg") + "Агресс.", "r:agg")],
+        [("➖", "ri-"), (f"реинвест: {s['reinvest']:g}%", "noop"), ("➕", "ri+")],
+        [(f"🧾 Налог: {'вкл ✅' if s['tax'] else 'выкл'}", "tax"),
+         (f"📡 {'Демо' if s['src'] == 'demo' else 'Реальные'}", "src")],
+        [("📊 Собрать портфель", "go")],
+    ]
 
 
 def main():

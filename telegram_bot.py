@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram-бот «AI-сборщик портфеля облигаций».
-Тонкая обёртка над tinvest_bond_bot.py. Режим: long polling (для Railway worker).
+Telegram-бот «AI-сборщик портфеля облигаций» — интерактивная панель.
+Тонкая обёртка над tinvest_bond_bot.py. Режим: long polling (Railway worker).
 
-Переменные окружения (задаются в Railway → Variables):
+Переменные окружения (Railway → Variables):
   TELEGRAM_TOKEN  — токен бота от @BotFather (обязательно)
-  TINVEST_TOKEN   — readonly-токен T-Invest (для реальных данных; без него — только /demo)
-  ALLOWED_USERS   — список Telegram user id через запятую, кому можно (НАСТОЯТЕЛЬНО задать!)
+  TINVEST_TOKEN   — readonly-токен T-Invest (для реальных данных)
+  ALLOWED_USERS   — список Telegram user id через запятую (задать!)
   MAX_CANDIDATES  — сколько облигаций тянуть из T-Invest (по умолчанию 60)
-  INCLUDE_QUAL    — "1" чтобы включать бумаги для квалов (по умолчанию выкл)
+  INCLUDE_QUAL    — "1" чтобы включать бумаги для квалов
 
 Команды:
-  /start /help — справка
-  /id          — показать свой Telegram id (чтобы вписать в ALLOWED_USERS)
-  /demo 1500000 3        — портфели на синтетике (без токена), сравнение 3 профилей
-  /p 1500000 3           — реальные данные, сравнение 3 профилей + кнопки
-  /p 1500000 3 mod 18    — конкретный профиль (риск mod/cons/agg), реинвест 18%
-  или просто сообщение:  1500000 3 mod
+  /start /help — открыть панель
+  /id          — показать свой Telegram id
 """
 import asyncio
 import logging
@@ -26,12 +22,15 @@ import time
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (Application, CommandHandler, MessageHandler,
                           CallbackQueryHandler, ContextTypes, filters)
 
 from tinvest_bond_bot import (build_portfolio, demo_universe,
-                              fetch_universe_from_tinvest, PROFILES,
-                              render_portfolio_html, render_compare_html)
+                              fetch_universe_from_tinvest,
+                              render_portfolio_html,
+                              default_panel, panel_text, panel_keyboard,
+                              apply_panel_action)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
@@ -41,65 +40,39 @@ TINVEST_TOKEN = os.environ.get("TINVEST_TOKEN")
 ALLOWED = {int(x) for x in os.environ.get("ALLOWED_USERS", "").replace(" ", "").split(",") if x}
 MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "60"))
 INCLUDE_QUAL = os.environ.get("INCLUDE_QUAL", "0") == "1"
-DEFAULT_REINVEST = 18.0
-DEFAULT_TAX = True
 
-_CACHE = {}            # key -> (timestamp, universe)
-_CACHE_TTL = 300       # сек — реальная вселенная кешируется на 5 минут
+_CACHE = {}
+_CACHE_TTL = 300
 
 HELP = (
     "<b>AI-сборщик портфеля облигаций</b>\n\n"
-    "Пришли параметры — соберу портфель на реальных данных T-Invest.\n\n"
-    "<b>Формат:</b> <code>сумма срок [риск] [реинвест%]</code>\n"
-    "Примеры:\n"
-    "• <code>1500000 3</code> — сравнение 3 профилей\n"
-    "• <code>1500000 3 mod</code> — умеренный, полный состав\n"
-    "• <code>3000000 5 agg 20</code> — агрессивный, реинвест 20%\n\n"
-    "Риск: <code>cons</code> (консерв.), <code>mod</code> (умерен.), <code>agg</code> (агресс.)\n\n"
-    "<b>Команды:</b>\n"
-    "/demo 1500000 3 — на синтетике, без реальных данных\n"
-    "/id — узнать свой Telegram id\n"
-    "/help — эта справка\n\n"
+    "Настрой параметры кнопками и нажми «Собрать портфель».\n"
+    "• Сумму, срок и реинвест меняй кнопками ➖/➕ или быстрыми пресетами\n"
+    "• Риск и налог — переключателями\n"
+    "• «📡 Данные» — демо или реальные котировки T-Invest\n\n"
+    "Команды: /start — панель, /id — твой Telegram id\n\n"
     "⚠️ Это не инвестиционная рекомендация. Бот считает план, заявки не выставляет."
 )
 
 
-def is_allowed(uid: int) -> bool:
+def is_allowed(uid):
     return (not ALLOWED) or (uid in ALLOWED)
 
 
-def parse_params(parts):
-    """['1500000','3','mod','18'] -> (amount, term, risk|None, reinvest, ok, err)"""
-    if len(parts) < 2:
-        return None, None, None, DEFAULT_REINVEST, False, "Нужно минимум: сумма и срок."
-    try:
-        amount = float(parts[0].replace(" ", "").replace("_", ""))
-        term = float(parts[1].replace(",", "."))
-    except ValueError:
-        return None, None, None, DEFAULT_REINVEST, False, "Сумма и срок должны быть числами."
-    if amount < 10000 or amount > 1e9:
-        return None, None, None, DEFAULT_REINVEST, False, "Сумма вне разумного диапазона."
-    if term < 0.5 or term > 15:
-        return None, None, None, DEFAULT_REINVEST, False, "Срок должен быть от 0.5 до 15 лет."
-    risk = None
-    reinvest = DEFAULT_REINVEST
-    for p in parts[2:]:
-        pl = p.lower()
-        if pl in PROFILES:
-            risk = pl
-        else:
-            try:
-                reinvest = float(pl.replace(",", "."))
-            except ValueError:
-                pass
-    return amount, term, risk, reinvest, True, None
+def kb(state):
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(t, callback_data=d) for t, d in row] for row in panel_keyboard(state)])
+
+
+def back_kb():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("◀ Изменить параметры", callback_data="back")]])
 
 
 def get_universe(term, demo):
     if demo:
         return demo_universe()
     if not TINVEST_TOKEN:
-        raise RuntimeError("TINVEST_TOKEN не задан — доступен только /demo.")
+        raise RuntimeError("не задан TINVEST_TOKEN")
     key = (round(term), INCLUDE_QUAL, MAX_CANDIDATES)
     now = time.time()
     hit = _CACHE.get(key)
@@ -110,107 +83,88 @@ def get_universe(term, demo):
     return uni
 
 
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_start(update, ctx):
+    if not is_allowed(update.effective_user.id):
+        await update.message.reply_text("Доступ закрыт. Узнай свой id командой /id.")
+        return
+    state = ctx.chat_data.setdefault("panel", default_panel())
+    await update.message.reply_text(panel_text(state), parse_mode=ParseMode.HTML, reply_markup=kb(state))
+
+
+async def cmd_help(update, ctx):
     await update.message.reply_text(HELP, parse_mode=ParseMode.HTML)
 
 
-async def cmd_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_id(update, ctx):
     u = update.effective_user
     await update.message.reply_text(
-        f"Твой Telegram id: <code>{u.id}</code>\n"
-        f"Впиши его в переменную ALLOWED_USERS на Railway, чтобы пользоваться ботом.",
+        f"Твой Telegram id: <code>{u.id}</code>\nВпиши его в ALLOWED_USERS на Railway.",
         parse_mode=ParseMode.HTML)
 
 
-async def _run(update: Update, ctx: ContextTypes.DEFAULT_TYPE, parts, demo):
-    uid = update.effective_user.id
-    if not is_allowed(uid):
-        await update.message.reply_text(
-            "Доступ закрыт. Узнай свой id командой /id и попроси владельца добавить тебя.")
-        return
-    amount, term, risk, reinvest, ok, err = parse_params(parts)
-    if not ok:
-        await update.message.reply_text(f"⚠️ {err}\n\nПодсказка: /help")
-        return
-
-    src = "синтетике" if demo else "реальных данных T-Invest"
-    msg = await update.message.reply_text(f"⏳ Считаю на {src}… (может занять до минуты)")
-
+async def _safe_edit(q, text, markup):
     try:
-        universe = await asyncio.to_thread(get_universe, term, demo)
-    except Exception as e:
-        await msg.edit_text(f"❌ Не удалось получить данные: {e}")
-        return
-    if not universe:
-        await msg.edit_text("❌ Не нашёл подходящих бумаг (проверь фильтры/доступ).")
-        return
-
-    # кешируем вселенную и параметры для кнопок «развернуть профиль»
-    ctx.chat_data["universe"] = universe
-    ctx.chat_data["amount"] = amount
-    ctx.chat_data["term"] = term
-    ctx.chat_data["reinvest"] = reinvest
-    ctx.chat_data["demo"] = demo
-
-    if risk:
-        res = await asyncio.to_thread(build_portfolio, universe, amount, term, risk)
-        await msg.edit_text(render_portfolio_html(res, amount, term, reinvest, DEFAULT_TAX),
-                            parse_mode=ParseMode.HTML)
-        return
-
-    results = {p: await asyncio.to_thread(build_portfolio, universe, amount, term, p)
-               for p in ("cons", "mod", "agg")}
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("Консерв.", callback_data="show|cons"),
-        InlineKeyboardButton("Умерен.", callback_data="show|mod"),
-        InlineKeyboardButton("Агресс.", callback_data="show|agg"),
-    ]])
-    await msg.edit_text(render_compare_html(results, amount, term),
-                        parse_mode=ParseMode.HTML, reply_markup=kb)
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            raise
 
 
-async def cmd_demo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await _run(update, ctx, ctx.args, demo=True)
-
-
-async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await _run(update, ctx, ctx.args, demo=False)
-
-
-async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await _run(update, ctx, update.message.text.split(), demo=False)
-
-
-async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def on_callback(update, ctx):
     q = update.callback_query
-    await q.answer()
     if not is_allowed(q.from_user.id):
+        await q.answer("Доступ закрыт", show_alert=True)
         return
-    _, risk = q.data.split("|")
-    universe = ctx.chat_data.get("universe")
-    if not universe:
-        await q.message.reply_text("Данные устарели, пришли параметры заново.")
+    data = q.data
+    state = ctx.chat_data.setdefault("panel", default_panel())
+
+    if data == "noop":
+        await q.answer()
         return
-    amount = ctx.chat_data["amount"]
-    term = ctx.chat_data["term"]
-    reinvest = ctx.chat_data.get("reinvest", DEFAULT_REINVEST)
-    res = await asyncio.to_thread(build_portfolio, universe, amount, term, risk)
-    await q.message.reply_text(render_portfolio_html(res, amount, term, reinvest, DEFAULT_TAX),
-                               parse_mode=ParseMode.HTML)
+
+    if data == "back":
+        await q.answer()
+        await _safe_edit(q, panel_text(state), kb(state))
+        return
+
+    if data == "go":
+        await q.answer()
+        demo = state["src"] == "demo"
+        src_label = "синтетике" if demo else "реальных данных T-Invest"
+        await _safe_edit(q, f"⏳ Считаю на {src_label}…", None)
+        try:
+            universe = await asyncio.to_thread(get_universe, state["term"], demo)
+            if not universe:
+                raise RuntimeError("не нашёл подходящих бумаг")
+            res = await asyncio.to_thread(build_portfolio, universe, state["amount"], state["term"], state["risk"])
+        except Exception as e:
+            msg = str(e)
+            if "t_tech" in msg or "tinkoff" in msg or "No module" in msg:
+                msg = ("библиотека T-Invest ещё не установлена на сервере "
+                       "(пакет на карантине PyPI). Пока доступен режим «Демо».")
+            await _safe_edit(q, f"❌ Не получилось: {msg}", back_kb())
+            return
+        text = render_portfolio_html(res, state["amount"], state["term"], state["reinvest"], state["tax"])
+        await _safe_edit(q, text, back_kb())
+        return
+
+    changed = apply_panel_action(state, data)
+    await q.answer()
+    if changed:
+        await _safe_edit(q, panel_text(state), kb(state))
 
 
 def main():
     if not TG_TOKEN:
         raise SystemExit("Не задан TELEGRAM_TOKEN")
     if not ALLOWED:
-        log.warning("ALLOWED_USERS пуст — бот открыт всем! Задай ALLOWED_USERS в переменных Railway.")
+        log.warning("ALLOWED_USERS пуст — бот открыт всем! Задай ALLOWED_USERS в Railway.")
     app = Application.builder().token(TG_TOKEN).build()
-    app.add_handler(CommandHandler(["start", "help"], cmd_start))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))
-    app.add_handler(CommandHandler("demo", cmd_demo))
-    app.add_handler(CommandHandler(["p", "portfolio"], cmd_portfolio))
-    app.add_handler(CallbackQueryHandler(on_button, pattern=r"^show\|"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_start))
     log.info("Бот запущен (polling).")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

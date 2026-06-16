@@ -1,1 +1,3 @@
 python-telegram-bot>=21,<22
+--extra-index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple
+t-tech-investments
