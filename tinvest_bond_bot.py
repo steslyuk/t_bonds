@@ -453,52 +453,30 @@ def _to_dec(q):
 
 
 def fetch_universe_from_tinvest(token, term_y, max_candidates, include_qual, unknown_rating, verbose=True):
-    ENDPOINT = "invest-public-api.tbank.ru:443"
+    # SSL решается через GRPC_DEFAULT_SSL_ROOTS_FILE_PATH=/root/tbank_chain.pem в /root/tbonds.env
     try:
         from t_tech.invest import Client, InstrumentStatus
     except ImportError:
         from tinkoff.invest import Client, InstrumentStatus
+    import warnings
     now = dt.datetime.now(dt.timezone.utc)
     horizon = now + dt.timedelta(days=int(term_y * 365 * 2.8) + 30)
     universe = []
 
-    # Явно передаём сертификат T-Invest —
-    # gRPC на Linux не принимает их цепочку без явного указания
-    import grpc
-    cert_paths = [
-        "/root/tbank_cert.pem",          # скачан вручную на сервере
-        "/etc/ssl/certs/ca-certificates.crt",  # системное хранилище Linux
-    ]
-    root_certs = None
-    for p in cert_paths:
-        try:
-            root_certs = open(p, "rb").read()
-            break
-        except Exception:
-            continue
-    creds = grpc.ssl_channel_credentials(root_certificates=root_certs)
+    with Client(token) as client:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            all_bonds = client.instruments.bonds(
+                instrument_status=InstrumentStatus.INSTRUMENT_STATUS_BASE).instruments
 
-    try:
-        client_ctx = Client(token, target=ENDPOINT, ssl_credentials=creds)
-    except TypeError:
-        try:
-            client_ctx = Client(token, target=ENDPOINT)
-        except TypeError:
-            client_ctx = Client(token)
-
-    with client_ctx as client:
-        bonds = client.instruments.bonds(instrument_status=InstrumentStatus.INSTRUMENT_STATUS_BASE).instruments
         cand = []
-        for b in bonds:
+        for b in all_bonds:
             try:
-                if b.currency != "rub":
-                    continue
-                if not b.api_trade_available_flag:
-                    continue
-                if b.for_qual_investor_flag and not include_qual:
-                    continue
-                if b.maturity_date is None or b.maturity_date <= now or b.maturity_date > horizon:
-                    continue
+                if b.currency != "rub": continue
+                if not b.api_trade_available_flag: continue
+                if b.for_qual_investor_flag and not include_qual: continue
+                mat = getattr(b, "maturity_date", None)
+                if mat is None or mat <= now or mat > horizon: continue
                 cand.append(b)
             except Exception:
                 continue
@@ -509,79 +487,76 @@ def fetch_universe_from_tinvest(token, term_y, max_candidates, include_qual, unk
         figis = [b.figi for b in cand]
         last = {}
         for i in range(0, len(figis), 100):
-            chunk = figis[i:i + 100]
-            for lp in client.market_data.get_last_prices(figi=chunk).last_prices:
-                last[lp.figi] = _to_dec(lp.price)  # цена в % номинала
+            try:
+                for lp in client.market_data.get_last_prices(figi=figis[i:i+100]).last_prices:
+                    v = _to_dec(lp.price)
+                    if v > 0: last[lp.figi] = v
+            except Exception:
+                pass
             time.sleep(0.05)
 
         for b in cand:
             try:
                 price_pct = last.get(b.figi)
-                if not price_pct or price_pct <= 0:
-                    continue
-                nominal = _to_dec(b.nominal)
+                if not price_pct or price_pct <= 0: continue
+                nominal = _to_dec(b.nominal) or NOMINAL_DEFAULT
                 aci = _to_dec(getattr(b, "aci_value", None))
                 aci_pct = (aci / nominal * 100) if nominal else 0
                 dirty = nominal * price_pct / 100 + aci
-
-                # купонный поток до погашения
-                cps = client.instruments.get_bond_coupons(
-                    figi=b.figi, from_=now, to=b.maturity_date).events
-                flows = []
-                annual_coupon_rub = 0.0
+                mat = b.maturity_date
+                try:
+                    cps = client.instruments.get_bond_coupons(figi=b.figi, from_=now, to=mat).events
+                except Exception:
+                    cps = []
+                flows, annual_coupon_rub = [], 0.0
                 for cp in cps:
                     amt = _to_dec(cp.pay_one_bond)
+                    if amt <= 0: continue
                     t = (cp.coupon_date - now).days / 365.0
                     if t > 0:
                         flows.append((t, amt))
-                        if t <= 1.0:
-                            annual_coupon_rub += amt
-                t_mat = (b.maturity_date - now).days / 365.0
-                flows.append((t_mat, nominal))  # погашение номинала
+                        if t <= 1.0: annual_coupon_rub += amt
+                t_mat = (mat - now).days / 365.0
+                if t_mat <= 0: continue
+                flows.append((t_mat, nominal))
+                if len(flows) < 2: continue
                 time.sleep(0.03)
-
                 y = ytm_from_cashflows(dirty, flows)
                 dur = modified_duration(dirty, flows, y)
-                if y is None or dur is None or dur <= 0:
-                    continue
+                if y is None or dur is None or dur <= 0 or y < 0: continue
                 ytm_pct = y * 100
-
-                # стакан -> ликвидность/глубина/импакт
+                if ytm_pct < 3 or ytm_pct > 60: continue
                 liq, depth = 1, 50
                 try:
-                    ob = client.market_data.get_order_book(figi=b.figi, depth=50)
-                    asks = ob.asks
-                    bids = ob.bids
+                    ob = client.market_data.get_order_book(figi=b.figi, depth=20)
+                    asks, bids = ob.asks, ob.bids
                     depth = max(1, sum(a.quantity for a in asks)) if asks else 1
                     if asks and bids:
-                        best_ask = _to_dec(asks[0].price)
-                        best_bid = _to_dec(bids[0].price)
-                        mid = (best_ask + best_bid) / 2 or 1
-                        spr = (best_ask - best_bid) / mid
+                        spr = (_to_dec(asks[0].price) - _to_dec(bids[0].price)) / ((_to_dec(asks[0].price) + _to_dec(bids[0].price)) / 2 or 1)
                         liq = 5 if spr < 0.001 else 4 if spr < 0.003 else 3 if spr < 0.007 else 2 if spr < 0.02 else 1
                     time.sleep(0.03)
                 except Exception:
                     pass
-
-                name = b.name or b.ticker
-                is_ofz = ("ОФЗ" in name) or (getattr(b, "sector", "") == "government") or b.ticker.startswith("SU")
-                internal = 10 if is_ofz else RATING_MAP.get(b.isin, RATING_MAP.get(b.ticker, unknown_rating))
-
+                name = b.name or getattr(b, "isin", "") or ""
+                ticker = getattr(b, "ticker", "") or ""
+                is_ofz = "ОФЗ" in name or ticker.startswith("SU")
+                internal = 10 if is_ofz else RATING_MAP.get(getattr(b, "isin", ""), RATING_MAP.get(ticker, unknown_rating))
+                if annual_coupon_rub <= 0 and len(flows) > 1:
+                    annual_coupon_rub = sum(amt for t, amt in flows[:-1]) / t_mat
                 universe.append(dict(
-                    id=b.ticker or b.figi, name=name,
-                    issuer=" ".join(name.split()[:2]).upper(),  # грубая группировка эмитента
+                    id=getattr(b, "isin", ticker) or ticker, name=name[:40],
+                    issuer=" ".join(name.split()[:2]).upper(),
                     sector=(getattr(b, "sector", "") or "прочее"),
                     internal=internal, couponPct=(annual_coupon_rub / nominal * 100) if nominal else 0,
                     pricePct=price_pct, aciPct=aci_pct, ytm=ytm_pct, durationY=dur,
                     depthLots=depth, liq=liq, nominal=nominal))
             except Exception as e:
                 if verbose:
-                    print(f"[skip] {b.ticker}: {e}", file=sys.stderr)
+                    print(f"[skip] {getattr(b,'isin','?')}: {e}", file=sys.stderr)
                 continue
     if verbose:
         print(f"[i] готово, бумаг с полными данными: {len(universe)}", file=sys.stderr)
     return universe
-
 
 # ----------------------------- вывод -----------------------------
 def fmt_rub(v):
