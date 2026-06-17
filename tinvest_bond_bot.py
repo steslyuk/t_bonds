@@ -540,7 +540,19 @@ def fetch_universe_from_tinvest(token, term_y, max_candidates, include_qual, unk
                 name = b.name or getattr(b, "isin", "") or ""
                 ticker = getattr(b, "ticker", "") or ""
                 is_ofz = "ОФЗ" in name or ticker.startswith("SU")
-                internal = 10 if is_ofz else RATING_MAP.get(getattr(b, "isin", ""), RATING_MAP.get(ticker, unknown_rating))
+                is_subfed = (getattr(b, "sector", "") or "").lower() in ("subfederal", "municipal") or \
+                            any(w in name for w in ("область", "край", "республика", "округ", "город"))
+
+                if is_ofz:
+                    internal = 10
+                elif is_subfed:
+                    internal = 8  # субфедеральные — между ОФЗ и первым эшелоном
+                elif RATING_MAP.get(getattr(b, "isin", ""), RATING_MAP.get(ticker)):
+                    internal = RATING_MAP.get(getattr(b, "isin", ""), RATING_MAP.get(ticker, unknown_rating))
+                else:
+                    # risk_level из T-Invest: 0=ОФЗ/госбумаги, 1=низкий, 2=средний, 3=высокий
+                    rl = getattr(b, "risk_level", 2)
+                    internal = {0: 10, 1: 8, 2: 6, 3: 4}.get(int(rl) if rl is not None else 2, unknown_rating)
                 if annual_coupon_rub <= 0 and len(flows) > 1:
                     annual_coupon_rub = sum(amt for t, amt in flows[:-1]) / t_mat
                 universe.append(dict(
