@@ -32,14 +32,14 @@ NOMINAL_DEFAULT = 1000.0
 
 # ----------------------------- профили риска -----------------------------
 PROFILES = {
-    "cons": dict(label="Консервативный", minAvg=8.2, floor=7, minLiq=3, sectorCap=0.30, issuerCap=0.15),
-    "mod":  dict(label="Умеренный",       minAvg=6.6, floor=5, minLiq=2, sectorCap=0.35, issuerCap=0.18),
-    "agg":  dict(label="Агрессивный",     minAvg=4.6, floor=3, minLiq=1, sectorCap=0.40, issuerCap=0.22),
+    "cons": dict(label="Консервативный", minAvg=7.0, floor=6, minLiq=1, sectorCap=0.60, issuerCap=0.25),
+    "mod":  dict(label="Умеренный",       minAvg=5.5, floor=4, minLiq=1, sectorCap=0.40, issuerCap=0.22),
+    "agg":  dict(label="Агрессивный",     minAvg=4.0, floor=3, minLiq=1, sectorCap=0.45, issuerCap=0.25),
 }
 LETTER = {10: "AAA", 9: "AA", 8: "A", 7: "BBB", 6: "BB", 5: "BB-", 4: "B+", 3: "B", 2: "CCC", 1: "C", 0: "D"}
 SPREAD = {5: 0.0008, 4: 0.0015, 3: 0.0030, 2: 0.0060, 1: 0.0120}
 SLOPE  = {5: 0.004,  4: 0.008,  3: 0.020,  2: 0.050,  1: 0.100}
-FILL0, BAND, RBUF = 0.30, 0.35, 0.06
+FILL0, BAND, RBUF = 0.30, 0.50, 0.06
 
 
 def letter_from_score(n):
@@ -213,14 +213,23 @@ def build_portfolio(universe, amount, term_y, profile_key):
     Dlo, Dhi, Rmin = term_y * (1 - BAND), term_y * (1 + BAND), cfg["minAvg"]
     cons = []
     cons.append({"a": [b["price"] for b in P], "type": "<=", "b": amount})
-    cons.append({"a": [b["price"] for b in P], "type": ">=", "b": 0.97 * amount})
-    cons.append({"a": [b["price"] * (b["internal"] - (Rmin + RBUF)) for b in P], "type": ">=", "b": 0})
+    cons.append({"a": [b["price"] for b in P], "type": ">=", "b": 0.90 * amount})
+    cons.append({"a": [b["price"] * (b["internal"] - Rmin) for b in P], "type": ">=", "b": 0})
     cons.append({"a": [b["price"] * (b["durationY"] - Dhi) for b in P], "type": "<=", "b": 0})
     cons.append({"a": [b["price"] * (b["durationY"] - Dlo) for b in P], "type": ">=", "b": 0})
     for s in {b["sector"] for b in P}:
         cons.append({"a": [b["price"] if b["sector"] == s else 0 for b in P], "type": "<=", "b": cfg["sectorCap"] * amount})
     for j in {b["issuer"] for b in P}:
         cons.append({"a": [b["price"] if b["issuer"] == j else 0 for b in P], "type": "<=", "b": cfg["issuerCap"] * amount})
+    # Диверсификация: максимальный вес одной бумаги зависит от профиля
+    # cons: 4% => минимум 25 бумаг
+    # mod:  5% => минимум 20 бумаг
+    # agg:  6% => минимум 17 бумаг (больше концентрации в доходных ВДО)
+    MAX_WEIGHT = {"cons": 0.04, "mod": 0.05, "agg": 0.06}.get(profile_key, 0.05)
+    for i in range(n):
+        a = [0.0] * n; a[i] = P[i]["price"]
+        cons.append({"a": a, "type": "<=", "b": MAX_WEIGHT * amount})
+
     c = [b["price"] * b["yEff"] for b in P]
 
     ub0 = [int(amount // b["price"]) for b in P]
@@ -480,9 +489,16 @@ def fetch_universe_from_tinvest(token, term_y, max_candidates, include_qual, unk
                 cand.append(b)
             except Exception:
                 continue
+        # Балансируем выборку: все ОФЗ + равномерно по уровням риска
+        ofz  = [b for b in cand if "ОФЗ" in (b.name or "") or (getattr(b,"ticker","") or "").startswith("SU")]
+        rl1  = [b for b in cand if getattr(b,"risk_level",2)==1 and b not in set(ofz)]
+        rl2  = [b for b in cand if getattr(b,"risk_level",2)==2]
+        rl3  = [b for b in cand if getattr(b,"risk_level",2)==3]
+        # берём все ОФЗ + по трети остатка из каждого уровня риска
+        per_bucket = max(10, (max_candidates - len(ofz)) // 3)
+        cand = ofz + rl1[:per_bucket] + rl2[:per_bucket] + rl3[:per_bucket]
         if verbose:
-            print(f"[i] облигаций после грубого фильтра: {len(cand)} (берём до {max_candidates})", file=sys.stderr)
-        cand = cand[:max_candidates]
+            print(f"[i] кандидатов: {len(cand)} (ОФЗ={len(ofz)} rl1={min(len(rl1),per_bucket)} rl2={min(len(rl2),per_bucket)} rl3={min(len(rl3),per_bucket)})", file=sys.stderr)
 
         figis = [b.figi for b in cand]
         last = {}
@@ -493,7 +509,7 @@ def fetch_universe_from_tinvest(token, term_y, max_candidates, include_qual, unk
                     if v > 0: last[lp.figi] = v
             except Exception:
                 pass
-            time.sleep(0.05)
+            time.sleep(0.1)
 
         for b in cand:
             try:
@@ -504,13 +520,27 @@ def fetch_universe_from_tinvest(token, term_y, max_candidates, include_qual, unk
                 aci_pct = (aci / nominal * 100) if nominal else 0
                 dirty = nominal * price_pct / 100 + aci
                 mat = b.maturity_date
-                try:
-                    cps = client.instruments.get_bond_coupons(figi=b.figi, from_=now, to=mat).events
-                except Exception:
-                    cps = []
+                cps = []
+                for _attempt in range(3):
+                    try:
+                        cps = client.instruments.get_bond_coupons(figi=b.figi, from_=now, to=mat).events
+                        break
+                    except Exception as ex:
+                        if "RESOURCE_EXHAUSTED" in str(ex):
+                            time.sleep(2)
+                        else:
+                            break
                 flows, annual_coupon_rub = [], 0.0
+                # флоатеры: будущие купоны = 0, заполняем последним известным
+                last_coupon = 0.0
+                for cp in cps:
+                    a = _to_dec(cp.pay_one_bond)
+                    if a > 0:
+                        last_coupon = a
                 for cp in cps:
                     amt = _to_dec(cp.pay_one_bond)
+                    if amt <= 0:
+                        amt = last_coupon  # подставляем последний известный купон
                     if amt <= 0: continue
                     t = (cp.coupon_date - now).days / 365.0
                     if t > 0:
@@ -520,7 +550,7 @@ def fetch_universe_from_tinvest(token, term_y, max_candidates, include_qual, unk
                 if t_mat <= 0: continue
                 flows.append((t_mat, nominal))
                 if len(flows) < 2: continue
-                time.sleep(0.03)
+                time.sleep(0.15)
                 y = ytm_from_cashflows(dirty, flows)
                 dur = modified_duration(dirty, flows, y)
                 if y is None or dur is None or dur <= 0 or y < 0: continue
@@ -540,19 +570,14 @@ def fetch_universe_from_tinvest(token, term_y, max_candidates, include_qual, unk
                 name = b.name or getattr(b, "isin", "") or ""
                 ticker = getattr(b, "ticker", "") or ""
                 is_ofz = "ОФЗ" in name or ticker.startswith("SU")
-                is_subfed = (getattr(b, "sector", "") or "").lower() in ("subfederal", "municipal") or \
-                            any(w in name for w in ("область", "край", "республика", "округ", "город"))
-
+                rmap = RATING_MAP.get(getattr(b, "isin", ""), RATING_MAP.get(ticker))
                 if is_ofz:
                     internal = 10
-                elif is_subfed:
-                    internal = 8  # субфедеральные — между ОФЗ и первым эшелоном
-                elif RATING_MAP.get(getattr(b, "isin", ""), RATING_MAP.get(ticker)):
-                    internal = RATING_MAP.get(getattr(b, "isin", ""), RATING_MAP.get(ticker, unknown_rating))
+                elif rmap:
+                    internal = rmap
                 else:
-                    # risk_level из T-Invest: 0=ОФЗ/госбумаги, 1=низкий, 2=средний, 3=высокий
                     rl = getattr(b, "risk_level", 2)
-                    internal = {0: 10, 1: 8, 2: 6, 3: 4}.get(int(rl) if rl is not None else 2, unknown_rating)
+                    internal = {0: 10, 1: 8, 2: 6, 3: 4}.get(int(rl) if rl is not None else 2, 6)
                 if annual_coupon_rub <= 0 and len(flows) > 1:
                     annual_coupon_rub = sum(amt for t, amt in flows[:-1]) / t_mat
                 universe.append(dict(
@@ -741,7 +766,7 @@ def main():
     ap.add_argument("--all-profiles", action="store_true", help="показать все три профиля")
     ap.add_argument("--max-candidates", type=int, default=60)
     ap.add_argument("--include-qual", action="store_true", help="включать бумаги для квалов")
-    ap.add_argument("--unknown-rating", type=int, default=4, help="рейтинг для бумаг без записи в RATING_MAP")
+    ap.add_argument("--unknown-rating", type=int, default=6, help="рейтинг для бумаг без записи в RATING_MAP")
     ap.add_argument("--json", action="store_true", help="вывод в JSON")
     args = ap.parse_args()
 
