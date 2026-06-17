@@ -453,14 +453,22 @@ def _to_dec(q):
 
 
 def fetch_universe_from_tinvest(token, term_y, max_candidates, include_qual, unknown_rating, verbose=True):
+    ENDPOINT = "invest-public-api.tbank.ru:443"
     try:
-        from t_tech.invest import Client, InstrumentStatus  # новый сервер Т-Банка
+        from t_tech.invest import Client, InstrumentStatus
+        _target = {"target": ENDPOINT}
     except ImportError:
-        from tinkoff.invest import Client, InstrumentStatus  # старый пакет с PyPI
+        from tinkoff.invest import Client, InstrumentStatus
+        _target = {"target": ENDPOINT}
     now = dt.datetime.now(dt.timezone.utc)
     horizon = now + dt.timedelta(days=int(term_y * 365 * 2.8) + 30)
     universe = []
-    with Client(token) as client:
+    try:
+        client_ctx = Client(token, **_target)
+    except TypeError:
+        # старая версия SDK не принимает target= как kwarg
+        client_ctx = Client(token)
+    with client_ctx as client:
         bonds = client.instruments.bonds(instrument_status=InstrumentStatus.INSTRUMENT_STATUS_BASE).instruments
         cand = []
         for b in bonds:
