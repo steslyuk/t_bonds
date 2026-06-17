@@ -462,13 +462,20 @@ def fetch_universe_from_tinvest(token, term_y, max_candidates, include_qual, unk
     horizon = now + dt.timedelta(days=int(term_y * 365 * 2.8) + 30)
     universe = []
 
-    # Явно передаём системные корневые сертификаты —
-    # gRPC на Linux иногда не принимает цепочку T-Invest без этого
-    import grpc, ssl, certifi
-    try:
-        root_certs = open(certifi.where(), "rb").read()
-    except Exception:
-        root_certs = None
+    # Явно передаём сертификат T-Invest —
+    # gRPC на Linux не принимает их цепочку без явного указания
+    import grpc
+    cert_paths = [
+        "/root/tbank_cert.pem",          # скачан вручную на сервере
+        "/etc/ssl/certs/ca-certificates.crt",  # системное хранилище Linux
+    ]
+    root_certs = None
+    for p in cert_paths:
+        try:
+            root_certs = open(p, "rb").read()
+            break
+        except Exception:
+            continue
     creds = grpc.ssl_channel_credentials(root_certificates=root_certs)
 
     try:
