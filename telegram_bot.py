@@ -102,12 +102,22 @@ async def cmd_id(update, ctx):
         parse_mode=ParseMode.HTML)
 
 
-async def _safe_edit(q, text, markup):
+async def _safe_edit(q, text, markup, html=True):
     try:
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        await q.edit_message_text(
+            text, parse_mode=(ParseMode.HTML if html else None), reply_markup=markup)
     except BadRequest as e:
-        if "not modified" not in str(e).lower():
-            raise
+        if "not modified" in str(e).lower():
+            return
+        # текст не прошёл HTML-парсинг (например, тех. ошибка с угловыми скобками) —
+        # повторяем без разметки, чтобы сообщение точно дошло
+        if html:
+            try:
+                await q.edit_message_text(text, parse_mode=None, reply_markup=markup)
+                return
+            except BadRequest:
+                pass
+        raise
 
 
 async def on_callback(update, ctx):
@@ -133,16 +143,27 @@ async def on_callback(update, ctx):
         src_label = "синтетике" if demo else "реальных данных T-Invest"
         await _safe_edit(q, f"⏳ Считаю на {src_label}…", None)
         try:
-            universe = await asyncio.to_thread(get_universe, state["term"], demo)
+            universe = await asyncio.wait_for(
+                asyncio.to_thread(get_universe, state["term"], demo), timeout=90)
             if not universe:
-                raise RuntimeError("не нашёл подходящих бумаг")
+                raise RuntimeError("не нашёл подходящих бумаг под эти параметры")
             res = await asyncio.to_thread(build_portfolio, universe, state["amount"], state["term"], state["risk"])
+        except asyncio.TimeoutError:
+            await _safe_edit(
+                q, "❌ T-Invest не ответил за 90 секунд. Скорее всего, у этого сервера "
+                "нет доступа к торговому API T-Invest (хостинг за пределами РФ). "
+                "Демо-режим работает; для реальных данных нужен сервер с доступом к РФ-инфраструктуре.",
+                back_kb(), html=False)
+            return
         except Exception as e:
             msg = str(e)
-            if "t_tech" in msg or "tinkoff" in msg or "No module" in msg:
-                msg = ("библиотека T-Invest ещё не установлена на сервере "
-                       "(пакет на карантине PyPI). Пока доступен режим «Демо».")
-            await _safe_edit(q, f"❌ Не получилось: {msg}", back_kb())
+            if "No module" in msg or "t_tech" in msg or "tinkoff" in msg:
+                msg = "библиотека T-Invest не установлена на сервере."
+            elif "UNAVAILABLE" in msg.upper():
+                msg = ("T-Invest вернул «UNAVAILABLE» — сервис недоступен с этого хостинга "
+                       "(вероятно, нет доступа к РФ-инфраструктуре из дата-центра). "
+                       "Демо-режим работает.")
+            await _safe_edit(q, f"❌ Не получилось: {msg}", back_kb(), html=False)
             return
         text = render_portfolio_html(res, state["amount"], state["term"], state["reinvest"], state["tax"])
         await _safe_edit(q, text, back_kb())
