@@ -456,18 +456,29 @@ def fetch_universe_from_tinvest(token, term_y, max_candidates, include_qual, unk
     ENDPOINT = "invest-public-api.tbank.ru:443"
     try:
         from t_tech.invest import Client, InstrumentStatus
-        _target = {"target": ENDPOINT}
     except ImportError:
         from tinkoff.invest import Client, InstrumentStatus
-        _target = {"target": ENDPOINT}
     now = dt.datetime.now(dt.timezone.utc)
     horizon = now + dt.timedelta(days=int(term_y * 365 * 2.8) + 30)
     universe = []
+
+    # Явно передаём системные корневые сертификаты —
+    # gRPC на Linux иногда не принимает цепочку T-Invest без этого
+    import grpc, ssl, certifi
     try:
-        client_ctx = Client(token, **_target)
+        root_certs = open(certifi.where(), "rb").read()
+    except Exception:
+        root_certs = None
+    creds = grpc.ssl_channel_credentials(root_certificates=root_certs)
+
+    try:
+        client_ctx = Client(token, target=ENDPOINT, ssl_credentials=creds)
     except TypeError:
-        # старая версия SDK не принимает target= как kwarg
-        client_ctx = Client(token)
+        try:
+            client_ctx = Client(token, target=ENDPOINT)
+        except TypeError:
+            client_ctx = Client(token)
+
     with client_ctx as client:
         bonds = client.instruments.bonds(instrument_status=InstrumentStatus.INSTRUMENT_STATUS_BASE).instruments
         cand = []
