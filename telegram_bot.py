@@ -38,6 +38,7 @@ log = logging.getLogger("bot")
 TG_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TINVEST_TOKEN = os.environ.get("TINVEST_TOKEN")
 ALLOWED = {int(x) for x in os.environ.get("ALLOWED_USERS", "").replace(" ", "").split(",") if x}
+ALLOWED_CHATS = {int(x) for x in os.environ.get("ALLOWED_CHATS", "").replace(" ", "").split(",") if x}
 MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "60"))
 INCLUDE_QUAL = os.environ.get("INCLUDE_QUAL", "0") == "1"
 
@@ -55,8 +56,14 @@ HELP = (
 )
 
 
-def is_allowed(uid):
-    return (not ALLOWED) or (uid in ALLOWED)
+def is_allowed(update):
+    chat = update.effective_chat
+    uid = update.effective_user.id if update.effective_user else None
+    if not ALLOWED and not ALLOWED_CHATS:
+        return True
+    if chat and chat.type in ("group", "supergroup") and chat.id in ALLOWED_CHATS:
+        return True
+    return uid in ALLOWED
 
 
 def kb(state):
@@ -78,13 +85,13 @@ def get_universe(term, demo):
     hit = _CACHE.get(key)
     if hit and now - hit[0] < _CACHE_TTL:
         return hit[1]
-    uni = fetch_universe_from_tinvest(TINVEST_TOKEN, term, MAX_CANDIDATES, INCLUDE_QUAL, 4, verbose=False)
+    uni = fetch_universe_from_tinvest(TINVEST_TOKEN, term, MAX_CANDIDATES, INCLUDE_QUAL, 6, verbose=False)
     _CACHE[key] = (now, uni)
     return uni
 
 
 async def cmd_start(update, ctx):
-    if not is_allowed(update.effective_user.id):
+    if not is_allowed(update):
         await update.message.reply_text("Доступ закрыт. Узнай свой id командой /id.")
         return
     state = ctx.chat_data.setdefault("panel", default_panel())
@@ -97,9 +104,12 @@ async def cmd_help(update, ctx):
 
 async def cmd_id(update, ctx):
     u = update.effective_user
-    await update.message.reply_text(
-        f"Твой Telegram id: <code>{u.id}</code>\nВпиши его в ALLOWED_USERS на Railway.",
-        parse_mode=ParseMode.HTML)
+    chat = update.effective_chat
+    txt = f"Твой Telegram id: <code>{u.id}</code>"
+    txt += f"\n[debug] chat.type={chat.type if chat else None} chat.id={chat.id if chat else None}"
+    if chat and chat.type in ("group", "supergroup"):
+        txt += f"\nID этой группы: <code>{chat.id}</code>\nВпиши ID группы в ALLOWED_CHATS на сервере."
+    await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 
 async def _safe_edit(q, text, markup, html=True):
@@ -122,7 +132,7 @@ async def _safe_edit(q, text, markup, html=True):
 
 async def on_callback(update, ctx):
     q = update.callback_query
-    if not is_allowed(q.from_user.id):
+    if not is_allowed(update):
         await q.answer("Доступ закрыт", show_alert=True)
         return
     data = q.data
@@ -185,7 +195,7 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, cmd_start))
     log.info("Бот запущен (polling).")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
