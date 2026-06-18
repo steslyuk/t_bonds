@@ -225,10 +225,11 @@ def build_portfolio(universe, amount, term_y, profile_key):
     # cons: 4% => минимум 25 бумаг
     # mod:  5% => минимум 20 бумаг
     # agg:  6% => минимум 17 бумаг (больше концентрации в доходных ВДО)
-    MAX_WEIGHT = {"cons": 0.04, "mod": 0.05, "agg": 0.06}.get(profile_key, 0.05)
-    for i in range(n):
-        a = [0.0] * n; a[i] = P[i]["price"]
-        cons.append({"a": a, "type": "<=", "b": MAX_WEIGHT * amount})
+    # Лесенка потолков веса (умная горка): топ по доходности — крупнее, хвост — мельче.
+    _rank = {idx: r for r, idx in enumerate(sorted(range(n), key=lambda k: -P[k]["yEff"]))}
+    def _wcap(i):
+        r = _rank[i]
+        return 0.075 if r < 3 else 0.055 if r < 8 else 0.035
 
     c = [b["price"] * b["yEff"] for b in P]
 
@@ -239,8 +240,17 @@ def build_portfolio(universe, amount, term_y, profile_key):
         if ub0[i] < 1e8:
             a = [0] * n; a[i] = 1
             cons_lp.append({"a": a, "type": "<=", "b": ub0[i]})
-    lp = simplex_max(c, cons_lp)
-    if lp["status"] != "optimal":
+    lp = None
+    for _relax in (1.0, 1.4, 2.0, 100.0):
+        cons_try = list(cons_lp)
+        for i in range(n):
+            cap = min(1.0, _wcap(i) * _relax)
+            a = [0.0] * n; a[i] = P[i]["price"]
+            cons_try.append({"a": a, "type": "<=", "b": cap * amount})
+        lp = simplex_max(c, cons_try)
+        if lp["status"] == "optimal":
+            break
+    if not lp or lp["status"] != "optimal":
         return empty
     investedLP = sum(P[i]["price"] * lp["x"][i] for i in range(n))
     LPyield = lp["obj"] / investedLP if investedLP else 0
@@ -281,6 +291,8 @@ def build_portfolio(universe, amount, term_y, profile_key):
             if cc > rem: continue
             if secCost.get(b["sector"], 0) + cc > cfg["sectorCap"] * amount + 1e-6: continue
             if issCost.get(b["issuer"], 0) + cc > cfg["issuerCap"] * amount + 1e-6: continue
+            cur_w = (lots[i] * P[i]["price"]) / amount
+            if cur_w >= _wcap(i) * 1.1: continue  # добивка не превышает потолок лесенки * 1.4
             sc = b["ytm"] + (3 + 6 * deficit if deficit > 0 else 0) * (b["internal"] - Rmin)
             if outside:
                 sc += max(-4, min(4, 0.9 * dir_ * (b["durationY"] - wd)))
@@ -346,7 +358,8 @@ def build_portfolio(universe, amount, term_y, profile_key):
     holdings, sY, sR, sD, couponIncome, inv = [], 0, 0, 0, 0, 0
     for i, b in enumerate(P):
         x = lots[i]
-        if x <= 0:
+        cc_check = b["nominal"] * (b["pricePct"] + b["aciPct"]) / 100 * x
+        if x <= 0 or cc_check < 0.003 * amount:  # убираем позиции с весом < 0.3%
             continue
         fill = min(1, x / b["depthLots"])
         ccost = b["nominal"] * (b["pricePct"] * (1 + SPREAD[b["liq"]] + SLOPE[b["liq"]] * fill) + b["aciPct"]) / 100 * x
